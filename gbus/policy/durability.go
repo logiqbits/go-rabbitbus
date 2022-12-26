@@ -1,6 +1,6 @@
 package policy
 
-import "github.com/streadway/amqp"
+import amqp "github.com/rabbitmq/amqp091-go"
 
 //Durable sets the outgoing amqp message delivery-mode property to durable (2)
 type Durable struct {

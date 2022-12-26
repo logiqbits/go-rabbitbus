@@ -4,7 +4,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 //TTL sets the ttl for the outgoing amqp message

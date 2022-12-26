@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/xid"
 	log "github.com/sirupsen/logrus"
-	"github.com/streadway/amqp"
 )
 
 var _ SagaRegister = &DefaultBus{}

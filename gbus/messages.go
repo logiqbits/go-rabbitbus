@@ -1,8 +1,8 @@
 package gbus
 
 import (
+	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/xid"
-	"github.com/streadway/amqp"
 )
 
 //BusMessage the structure that gets sent to the underlying transport

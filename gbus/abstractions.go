@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"time"
 
-	"github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 //Bus interface provides the majority of functionality to Send, Reply and Publish messages to the Bus
