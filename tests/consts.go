@@ -30,7 +30,7 @@ func createBusWithOptions(svcName string, deadletter string, txnl, pos bool) gbu
 		WithConfirms()
 
 	if txnl {
-		// busBuilder = busBuilder.Txnl("mysql", "rhinof:rhinof@/rhinof")
+		//TODO: transactional provider
 	}
 	if deadletter != "" {
 		busBuilder = busBuilder.WithDeadlettering(deadletter)
