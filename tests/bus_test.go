@@ -208,8 +208,8 @@ func TestRPC(t *testing.T) {
 
 // func TestDeadlettering(t *testing.T) {
 // 	poision := gbus.NewBusMessage(PoisionMessage{})
-// 	service1 := createBusWithOptions(testSvc1, "grabbit-dead", true, true)
-// 	deadletterSvc := createBusWithOptions("deadletterSvc", "grabbit-dead", true, true)
+// 	service1 := createBusWithOptions(testSvc1, "go-rabbitbus-dead", true, true)
+// 	deadletterSvc := createBusWithOptions("deadletterSvc", "go-rabbitbus-dead", true, true)
 // 	proceed := make(chan bool)
 // 	handler := func(tx *sql.Tx, poision amqp.Delivery) error {
 // 		proceed <- true

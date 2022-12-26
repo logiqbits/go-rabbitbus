@@ -66,7 +66,7 @@ var (
 
 	//MaxRetryCount defines the max times a retry can run
 	MaxRetryCount uint = 3
-	rpcHeaderName      = "x-grabbit-msg-rpc-id"
+	rpcHeaderName      = "x-logiqbits-rabbitbus-msg-rpc-id"
 )
 
 func (b *DefaultBus) createRPCQueue() (amqp.Queue, error) {

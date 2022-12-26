@@ -43,5 +43,5 @@ func createBusWithOptions(svcName string, deadletter string, txnl, pos bool) gbu
 }
 
 func createNamedBusForTest(svcName string) gbus.Bus {
-	return createBusWithOptions(svcName, "dead-grabbit", true, true)
+	return createBusWithOptions(svcName, "dead-logiqbits-rabbitbus", true, true)
 }

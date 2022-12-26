@@ -38,7 +38,7 @@ func (bm *BusMessage) GetAMQPHeaders() (headers amqp.Table) {
 	headers = amqp.Table{}
 	headers["x-msg-saga-id"] = bm.SagaID
 	headers["x-msg-saga-correlation-id"] = bm.SagaCorrelationID
-	headers["x-grabbit-msg-rpc-id"] = bm.RPCID
+	headers["x-logiqbits-rabbitbus-msg-rpc-id"] = bm.RPCID
 	headers["x-msg-name"] = bm.Payload.SchemaName()
 
 	return
@@ -49,7 +49,7 @@ func (bm *BusMessage) SetFromAMQPHeaders(headers amqp.Table) {
 
 	bm.SagaID = castToString(headers["x-msg-saga-id"])
 	bm.SagaCorrelationID = castToString(headers["x-msg-saga-correlation-id"])
-	bm.RPCID = castToString(headers["x-grabbit-msg-rpc-id"])
+	bm.RPCID = castToString(headers["x-logiqbits-rabbitbus-msg-rpc-id"])
 	bm.PayloadFQN = castToString(headers["x-msg-name"])
 
 }
@@ -77,5 +77,5 @@ type SagaTimeoutMessage struct {
 
 //SchemaName implements gbus.Message
 func (SagaTimeoutMessage) SchemaName() string {
-	return "grabbit.timeout"
+	return "logiqbits.rabbitbus.timeout"
 }
