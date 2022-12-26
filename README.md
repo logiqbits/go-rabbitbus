@@ -22,6 +22,7 @@ Pattern wise messaging examples
 
 * [Command-Reply](#command-reply)
 * [Publish/Subscribe](#pub-sub)
+* [RPC](#rpc)
 
 
 #### Command-Reply
