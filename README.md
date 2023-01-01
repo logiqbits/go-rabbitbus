@@ -151,12 +151,15 @@ bus :=  builder.
         WithConfirms().
         Build(eventName)
 
-err := b.Publish(context.Background(), "test_exchange", "test_topic", gbus.NewBusMessage(&Event1{Data: time.Now().String()}))
+//need to start the bus before sending/publishing
+bus.Start()
+
+err := bus.Publish(context.Background(), "test_exchange", "test_topic", gbus.NewBusMessage(&Event1{Data: time.Now().String()}))
 if err != nil {
   log.Fatal(err)
 }
 
-bus.Start()
+
 defer bus.Shutdown()
 ```
 
