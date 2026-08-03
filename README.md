@@ -4,6 +4,8 @@ This repository is a fork of [https://github.com/rhinof/grabbit](https://github.
 
 RabbitMQ based service bus for GoLang
 
+> A Python implementation is available at [python-rabbitbus](https://github.com/logiqbits/python-rabbitbus). It is wire-compatible with this library, so Go and Python services can exchange commands, events, and RPC calls over the same RabbitMQ broker. See [Cross-language messaging with Python](#cross-language-messaging-with-python) below.
+
 
 
 ### How to use
@@ -249,3 +251,55 @@ log.Println(reply.Payload) // should be 'Hello Mr. Jack'
 
 
 
+## Cross-language messaging with Python
+
+The [python-rabbitbus](https://github.com/logiqbits/python-rabbitbus) library implements the same AMQP conventions and messaging patterns. To communicate with a Python service, configure the Go bus to use the JSON serializer and make sure message schema names and JSON field names match on both sides.
+
+### Message schema naming
+
+Use the same `SchemaName()` value and compatible JSON tags:
+
+```go
+// Go
+type Command1 struct {
+    Data string `json:"data"`
+}
+
+func (Command1) SchemaName() string { return "example.Command1" }
+```
+
+```python
+# Python
+class Command1(Message):
+    def __init__(self, data: str = ""):
+        self.data = data
+
+    def schema_name(self) -> str:
+        return "example.Command1"
+```
+
+### Go service configured for Python interop
+
+```go
+import (
+    "github.com/logiqbits/go-rabbitbus/gbus"
+    "github.com/logiqbits/go-rabbitbus/gbus/builder"
+    "github.com/logiqbits/go-rabbitbus/gbus/policy"
+    "github.com/logiqbits/go-rabbitbus/gbus/serialization"
+)
+
+bus := builder.New().Bus("amqp://guest:guest@localhost").
+    WithSerializer(serialization.NewJsonSerializer()).
+    WithPolicies(&policy.Durable{}).
+    Build("go.svc")
+```
+
+After that, `bus.Send(...)`, `bus.Publish(...)`, and `bus.RPC(...)` work transparently with Python peers.
+
+### Supported patterns
+
+- **Command-Reply** — Go sends a command to a Python service name; Python replies to the Go service queue.
+- **Pub/Sub** — Go publishes to a topic exchange; Python subscribes with `handle_event(...)`, and vice versa.
+- **RPC** — Go calls `bus.RPC(...)` targeting a Python service; Python handles the request and replies to the Go RPC queue.
+
+See the `python-rabbitbus` README for a complete bidirectional example.
