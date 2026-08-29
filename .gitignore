@@ -22,3 +22,5 @@ go.work
 
 #Others
 .DS_Store
+
+.env

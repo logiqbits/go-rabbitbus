@@ -55,6 +55,7 @@ type DefaultBus struct {
 	DLX                  string
 	DefaultPolicies      []MessagePolicy
 	Confirm              bool
+	ResendsBufferSize    int
 	healthChan           chan error
 	backpreasure         bool
 	rabbitFailure        bool
@@ -182,7 +183,7 @@ func (b *DefaultBus) Start() error {
 	//TODO:Figure out what should be done
 
 	//init the outbox that sends the messages to the amqp transport and handles publisher confirms
-	if b.Outgoing.init(b.outAMQPChannel, b.Confirm, true); e != nil {
+	if b.Outgoing.init(b.outAMQPChannel, b.Confirm, true, b.ResendsBufferSize); e != nil {
 		return e
 	}
 	/*
@@ -198,7 +199,7 @@ func (b *DefaultBus) Start() error {
 		}
 		amqpChan.NotifyClose(b.amqpErrors)
 		amqpOutbox := &AMQPOutbox{}
-		amqpOutbox.init(amqpChan, b.Confirm, false)
+		amqpOutbox.init(amqpChan, b.Confirm, false, b.ResendsBufferSize)
 		if startErr := b.Outbox.Start(amqpOutbox); startErr != nil {
 			b.log("failed to start transactional relay\n%v", startErr)
 			return startErr

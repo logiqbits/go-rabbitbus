@@ -27,6 +27,7 @@ type defaultBuilder struct {
 	confirm          bool
 	dbPingTimeout    time.Duration
 	usingPingTimeout bool
+	resendsBufferSize int
 }
 
 func (builder *defaultBuilder) Build(svcName string) gbus.Bus {
@@ -55,6 +56,11 @@ func (builder *defaultBuilder) Build(svcName string) gbus.Bus {
 		gb.WorkerNum = 1
 	} else {
 		gb.WorkerNum = builder.workerNum
+	}
+	if builder.resendsBufferSize < 1 {
+		gb.ResendsBufferSize = 100
+	} else {
+		gb.ResendsBufferSize = builder.resendsBufferSize
 	}
 	gb.PrefetchCount = builder.PrefetchCount
 	var (
@@ -115,6 +121,11 @@ func (builder *defaultBuilder) WithSagas(sagaStoreConnStr string) gbus.Builder {
 
 func (builder *defaultBuilder) WithConfirms() gbus.Builder {
 	builder.confirm = true
+	return builder
+}
+
+func (builder *defaultBuilder) WithResendsBufferSize(size int) gbus.Builder {
+	builder.resendsBufferSize = size
 	return builder
 }
 
