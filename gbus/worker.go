@@ -37,6 +37,7 @@ type worker struct {
 	txProvider        TxProvider
 	amqpErrors        chan *amqp.Error
 	stop              chan bool
+	stopped           chan struct{}
 }
 
 func (worker *worker) Start() error {
@@ -58,6 +59,7 @@ func (worker *worker) Start() error {
 	worker.messages = messages
 	worker.rpcMessages = rpcmsgs
 	worker.stop = make(chan bool)
+	worker.stopped = make(chan struct{})
 	go worker.consumeMessages()
 
 	return nil
@@ -66,6 +68,14 @@ func (worker *worker) Start() error {
 func (worker *worker) Stop() error {
 	worker.log().Info("stopping worker")
 	close(worker.stop) // worker.stop <- true
+	if worker.stopped != nil {
+		select {
+		case <-worker.stopped:
+			worker.log().Info("worker stopped gracefully")
+		case <-time.After(30 * time.Second):
+			worker.log().Warn("timed out waiting for worker to stop")
+		}
+	}
 	return nil
 }
 
@@ -85,6 +95,7 @@ func (worker *worker) createMessagesChannel(q amqp.Queue, consumerTag string) (<
 }
 
 func (worker *worker) consumeMessages() {
+	defer close(worker.stopped)
 
 	//TODO:Handle panics due to tx errors so the consumption of messages will continue
 	for {
@@ -97,6 +108,7 @@ func (worker *worker) consumeMessages() {
 
 		case <-worker.stop:
 			worker.log().Info("stopped consuming messages")
+			worker.cancelConsumers()
 			return
 		case msgDelivery, ok := <-worker.messages:
 			if ok {
@@ -125,6 +137,15 @@ func (worker *worker) consumeMessages() {
 
 	}
 
+}
+
+func (worker *worker) cancelConsumers() {
+	if worker.channel == nil {
+		return
+	}
+	_ = worker.channel.Cancel(worker.consumerTag, false)
+	_ = worker.channel.Cancel(worker.consumerTag+"_rpc", false)
+	_ = worker.channel.Close()
 }
 
 func (worker *worker) extractBusMessage(delivery amqp.Delivery) (*BusMessage, error) {

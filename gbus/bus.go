@@ -290,13 +290,28 @@ func (b *DefaultBus) Shutdown() (shutdwonErr error) {
 		}
 	}()
 
+	// Signal the health monitor to exit before we start tearing down channels,
+	// so it does not send on a closed health channel or panic on a closed
+	// connection notification.
+	b.started = false
+
 	for _, worker := range b.workers {
 		worker.Stop()
 	}
 
 	b.Outgoing.shutdown()
-	b.started = false
-	b.amqpConn.Close()
+
+	if b.AMQPChannel != nil {
+		_ = b.AMQPChannel.Close()
+	}
+	if b.outAMQPChannel != nil {
+		_ = b.outAMQPChannel.Close()
+	}
+
+	if b.amqpConn != nil {
+		_ = b.amqpConn.Close()
+	}
+
 	if b.IsTxnl {
 		b.TxProvider.Dispose()
 		b.Outbox.Stop()
