@@ -21,17 +21,19 @@ type AMQPOutbox struct {
 	stop         chan bool
 }
 
-func (out *AMQPOutbox) init(amqp *amqp.Channel, confirm, resendOnNack bool) error {
+func (out *AMQPOutbox) init(amqp *amqp.Channel, confirm, resendOnNack bool, resendsBufferSize int) error {
 	out.stop = make(chan bool)
 	out.pending = make(map[uint64]pendingConfirmation)
 	out.locker = &sync.Mutex{}
 	out.channel = amqp
 	out.confirm = confirm
 	if confirm {
-
+		if resendsBufferSize < 1 {
+			resendsBufferSize = 100
+		}
 		out.ack = make(chan uint64, 10)
 		out.nack = make(chan uint64, 10)
-		out.resends = make(chan pendingConfirmation)
+		out.resends = make(chan pendingConfirmation, resendsBufferSize)
 
 		err := out.channel.Confirm(false /*noWait*/)
 

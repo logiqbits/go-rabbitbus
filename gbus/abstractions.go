@@ -153,6 +153,13 @@ type Builder interface {
 	*/
 	WithConfirms() Builder
 
+	/*
+	   WithResendsBufferSize sets the buffer size for the publisher-confirm
+	   resends channel. A larger buffer prevents deadlocks when NACKs arrive
+	   while the publish path is blocked. Default is 100.
+	*/
+	WithResendsBufferSize(size int) Builder
+
 	//WithPolicies defines the default policies that are applied for evey outgoing amqp messge
 	WithPolicies(policies ...MessagePolicy) Builder
 

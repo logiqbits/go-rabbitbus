@@ -55,6 +55,7 @@ type DefaultBus struct {
 	DLX                  string
 	DefaultPolicies      []MessagePolicy
 	Confirm              bool
+	ResendsBufferSize    int
 	healthChan           chan error
 	backpreasure         bool
 	rabbitFailure        bool
@@ -182,7 +183,7 @@ func (b *DefaultBus) Start() error {
 	//TODO:Figure out what should be done
 
 	//init the outbox that sends the messages to the amqp transport and handles publisher confirms
-	if b.Outgoing.init(b.outAMQPChannel, b.Confirm, true); e != nil {
+	if b.Outgoing.init(b.outAMQPChannel, b.Confirm, true, b.ResendsBufferSize); e != nil {
 		return e
 	}
 	/*
@@ -198,7 +199,7 @@ func (b *DefaultBus) Start() error {
 		}
 		amqpChan.NotifyClose(b.amqpErrors)
 		amqpOutbox := &AMQPOutbox{}
-		amqpOutbox.init(amqpChan, b.Confirm, false)
+		amqpOutbox.init(amqpChan, b.Confirm, false, b.ResendsBufferSize)
 		if startErr := b.Outbox.Start(amqpOutbox); startErr != nil {
 			b.log("failed to start transactional relay\n%v", startErr)
 			return startErr
@@ -289,13 +290,28 @@ func (b *DefaultBus) Shutdown() (shutdwonErr error) {
 		}
 	}()
 
+	// Signal the health monitor to exit before we start tearing down channels,
+	// so it does not send on a closed health channel or panic on a closed
+	// connection notification.
+	b.started = false
+
 	for _, worker := range b.workers {
 		worker.Stop()
 	}
 
 	b.Outgoing.shutdown()
-	b.started = false
-	b.amqpConn.Close()
+
+	if b.AMQPChannel != nil {
+		_ = b.AMQPChannel.Close()
+	}
+	if b.outAMQPChannel != nil {
+		_ = b.outAMQPChannel.Close()
+	}
+
+	if b.amqpConn != nil {
+		_ = b.amqpConn.Close()
+	}
+
 	if b.IsTxnl {
 		b.TxProvider.Dispose()
 		b.Outbox.Stop()
@@ -386,38 +402,100 @@ func (b *DefaultBus) RPC(ctx context.Context, service string, request, reply *Bu
 		return nil, errors.New("bus not strated or already shutdown, make sure you call bus.Start() before sending messages")
 	}
 
-	b.RPCLock.Lock()
 	rpcID := xid.New().String()
 	request.RPCID = rpcID
-	replyChan := make(chan *BusMessage)
-	handler := func(invocation Invocation, message *BusMessage) error {
-		replyChan <- message
-		return nil
+	request.Semantics = "cmd"
+
+	// Use a dedicated short-lived connection for the request and its reply.
+	// The consumer connection may be blocked by a long-running handler, so we
+	// can't rely on the shared bus consumer loop to process RPC replies.
+	conn, err := amqp.Dial(b.AmqpConnStr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		return nil, err
+	}
+	defer ch.Close()
+
+	replyQueue, err := ch.QueueDeclare(
+		"",    /*name*/
+		false, /*durable*/
+		true,  /*autoDelete*/
+		true,  /*exclusive*/
+		false, /*noWait*/
+		nil,   /*args*/
+	)
+	if err != nil {
+		return nil, err
 	}
 
-	b.RPCHandlers[rpcID] = handler
-	//we do not defer this as we do not want b.RPCHandlers to be locked until a reply returns
-	b.RPCLock.Unlock()
-	request.Semantics = "cmd"
-	rpc := rpcPolicy{
-		rpcID: rpcID}
+	msgs, err := ch.Consume(
+		replyQueue.Name,
+		"",    /*consumer*/
+		true,  /*autoAck*/
+		false, /*exclusive*/
+		false, /*noLocal*/
+		false, /*noWait*/
+		nil,   /*args*/
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	b.Serializer.Register(reply.Payload)
-	b.sendImpl(ctx, nil, service, b.rpcQueue.Name, "", "", request, rpc)
 
-	//wait for reply or timeout
-	select {
-	case reply := <-replyChan:
+	rpc := rpcPolicy{rpcID: rpcID}
 
-		b.RPCLock.Lock()
-		delete(b.RPCHandlers, rpcID)
-		b.RPCLock.Unlock()
-		return reply, nil
-	case <-time.After(timeout):
-		b.RPCLock.Lock()
-		delete(b.RPCHandlers, rpcID)
-		b.RPCLock.Unlock()
-		return nil, errors.New("rpc call timed out")
+	headers := request.GetAMQPHeaders()
+	buffer, err := b.Serializer.Encode(request.Payload)
+	if err != nil {
+		b.log("failed to encode RPC request: %v", err)
+		return nil, err
+	}
+
+	msg := amqp.Publishing{
+		Body:            buffer,
+		ReplyTo:         replyQueue.Name,
+		MessageId:       request.ID,
+		CorrelationId:   request.CorrelationID,
+		ContentEncoding: b.Serializer.Name(),
+		Headers:         headers,
+	}
+
+	for _, defaultPolicy := range b.DefaultPolicies {
+		defaultPolicy.Apply(&msg)
+	}
+	rpc.Apply(&msg)
+
+	if err = ch.Publish("", service, false, false, msg); err != nil {
+		return nil, err
+	}
+
+	deadline := time.After(timeout)
+	for {
+		select {
+		case delivery := <-msgs:
+			bm := NewFromAMQPHeaders(delivery.Headers)
+			bm.ID = delivery.MessageId
+			bm.CorrelationID = delivery.CorrelationId
+			if delivery.Exchange != "" {
+				bm.Semantics = "evt"
+			} else {
+				bm.Semantics = "cmd"
+			}
+			payload, decErr := b.Serializer.Decode(delivery.Body, bm.PayloadFQN)
+			if decErr != nil {
+				return nil, decErr
+			}
+			bm.Payload = payload
+			return bm, nil
+		case <-deadline:
+			return nil, errors.New("rpc call timed out")
+		}
 	}
 }
 
