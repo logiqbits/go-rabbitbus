@@ -31,6 +31,7 @@ type worker struct {
 	registrations     []*Registration
 	rpcHandlers       map[string]MessageHandler
 	deadletterHandler func(tx *sql.Tx, poision amqp.Delivery) error
+	noHandlerAction   NoHandlerAction
 	isTxnl            bool
 	b                 *DefaultBus
 	serializer        Serializer
@@ -130,13 +131,31 @@ func (worker *worker) consumeMessages() {
 		*/
 		if shouldProceed {
 
-			worker.processMessage(delivery, isRPCreply)
+			worker.processMessageSafely(delivery, isRPCreply)
 		} else {
-			worker.log().WithField("message id", delivery.MessageId).Warn("no proceed")
+			//the delivery channel was closed (connection or channel gone); there is no
+			//more message source for this consumer so exit instead of hot-spinning
+			worker.log().WithField("message id", delivery.MessageId).Warn("delivery channel closed, stopping consumer")
+			return
 		}
 
 	}
 
+}
+
+// processMessageSafely guards the per-message processing so a panic becomes a
+// reject+log instead of killing the consume goroutine (and losing the message silently)
+func (worker *worker) processMessageSafely(delivery amqp.Delivery, isRPCreply bool) {
+	defer func() {
+		if p := recover(); p != nil {
+			pncMsg := fmt.Sprintf("%v\n%s", p, debug.Stack())
+			worker.log().WithField("stack", pncMsg).Error("recovered from panic while processing message; rejecting")
+			if rejectErr := worker.Reject(false, delivery); rejectErr != nil {
+				worker.log().WithError(rejectErr).Error("failed to reject message after panic")
+			}
+		}
+	}()
+	worker.processMessage(delivery, isRPCreply)
 }
 
 func (worker *worker) cancelConsumers() {
@@ -226,9 +245,16 @@ func (worker *worker) isDead(delivery amqp.Delivery) bool {
 }
 
 func (worker *worker) invokeDeadletterHandler(delivery amqp.Delivery) {
+	if worker.txProvider == nil {
+		worker.log().WithField("message id", delivery.MessageId).
+			Warn("deadletter handler registered on a non-transactional bus; rejecting message")
+		worker.Reject(false, delivery)
+		return
+	}
 	tx, txCreateErr := worker.txProvider.New()
 	if txCreateErr != nil {
-		worker.Ack(delivery)
+		worker.log().WithError(txCreateErr).Error("failed to create transaction for deadletter handler; rejecting message")
+		worker.Reject(false, delivery)
 		return
 	}
 	deadErr := worker.deadletterHandler(tx, delivery)
@@ -258,6 +284,16 @@ func (worker *worker) processMessage(delivery amqp.Delivery, isRPCreply bool) {
 
 	//handle a message that originated from a deadletter exchange
 	if worker.isDead(delivery) {
+		if worker.deadletterHandler == nil {
+			//no deadletter handler registered; reject (requeue=false) so the message is
+			//deliberately routed to the DLX instead of acked away or crashing the worker
+			worker.log().WithFields(log.Fields{"message id": delivery.MessageId, "routing key": delivery.RoutingKey}).
+				Warn("dead-lettered message received but no deadletter handler registered; rejecting (requeue=false)")
+			if rejectErr := worker.Reject(false, delivery); rejectErr != nil {
+				worker.log().WithError(rejectErr).Error("failed to reject dead-lettered message")
+			}
+			return
+		}
 		worker.log().Info("invoking deadletter handler")
 		worker.invokeDeadletterHandler(delivery)
 		return
@@ -277,9 +313,15 @@ func (worker *worker) processMessage(delivery amqp.Delivery, isRPCreply bool) {
 				log.Fields{"Message Name": bm.PayloadFQN,
 					"Message Type": bm.Semantics}).
 			Warn("Message received but no handlers found")
-		// worker.log("Message received but no handlers found\nMessage name:%v\nMessage Type:%v\nRejecting message", bm.PayloadFQN, bm.Semantics)
-		//remove the message by acking it and not rejecting it so it will not be routed to a deadletter queue
-		worker.Ack(delivery)
+		if worker.noHandlerAction == NoHandlerReject {
+			worker.log().Warn("no handlers found and NoHandlerReject configured; rejecting message (requeue=false)")
+			if rejectErr := worker.Reject(false, delivery); rejectErr != nil {
+				worker.log().WithError(rejectErr).Error("failed to reject message with no handlers")
+			}
+		} else {
+			//remove the message by acking it and not rejecting it so it will not be routed to a deadletter queue
+			worker.Ack(delivery)
+		}
 		return
 	}
 
