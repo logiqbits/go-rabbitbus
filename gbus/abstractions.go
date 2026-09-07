@@ -16,6 +16,42 @@ type Bus interface {
 	Messaging
 	SagaRegister
 	Health
+	BusManagement
+}
+
+// NoHandlerAction determines how the bus treats an incoming message for which no handler is registered
+type NoHandlerAction int
+
+const (
+	//NoHandlerAck acks the message and drops it. This is the default and preserves the legacy behavior
+	NoHandlerAck NoHandlerAction = iota
+	//NoHandlerReject rejects the message (requeue=false) so it is routed to the dead-letter exchange instead of silently vanishing
+	NoHandlerReject
+)
+
+// BusManagement exposes additive, read-only management operations on the bus
+type BusManagement interface {
+	/*
+		Health reports whether the bus is in a usable state: connected to the broker,
+		channels open, started and no rabbit failure flagged. When it returns false the
+		owner should restart the bus (or the process).
+	*/
+	Health() bool
+	/*
+		QueueDepth returns the number of messages currently held in the given queue.
+		It uses a passive declare on a short-lived channel, so the queue must already exist.
+	*/
+	QueueDepth(queue string) (int, error)
+	/*
+		Purge removes all messages from the given queue and returns the number of purged messages.
+	*/
+	Purge(queue string) (int, error)
+	/*
+		DeadletterCount returns the depth of the queue bound to the dead-letter exchange for this
+		service. It returns 0, nil when no dead-letter exchange is configured. Note: in this
+		topology the service queue itself is bound to the DLX, so the count reflects that queue's depth.
+	*/
+	DeadletterCount() (int, error)
 }
 
 //Message a common interface that passes to the serializers to allow decoding and encoding of content
@@ -162,6 +198,19 @@ type Builder interface {
 
 	//WithPolicies defines the default policies that are applied for evey outgoing amqp messge
 	WithPolicies(policies ...MessagePolicy) Builder
+
+	/*
+	   WithMandatory turns on mandatory publishing: unroutable messages are returned
+	   by the broker and surface as an error from Send/Publish instead of being dropped
+	   silently. Implies publisher confirms on the outgoing channel.
+	*/
+	WithMandatory() Builder
+
+	/*
+	   WithNoHandlerAction decides what the bus does with a message for which no handler
+	   is registered. Defaults to NoHandlerAck (legacy behavior: ack and drop).
+	*/
+	WithNoHandlerAction(action NoHandlerAction) Builder
 
 	//ConfigureHealthCheck defines the default timeout in seconds for the db ping check
 	ConfigureHealthCheck(timeoutInSeconds time.Duration) Builder

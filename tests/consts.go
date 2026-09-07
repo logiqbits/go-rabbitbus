@@ -1,6 +1,8 @@
 package tests
 
 import (
+	"os"
+
 	"github.com/logiqbits/go-rabbitbus/gbus"
 	"github.com/logiqbits/go-rabbitbus/gbus/builder"
 	"github.com/logiqbits/go-rabbitbus/gbus/policy"
@@ -12,7 +14,10 @@ var testSvc2 string
 var testSvc3 string
 
 func init() {
-	connStr = "amqp://guest:guest@localhost"
+	connStr = os.Getenv("RABBITBUS_AMQP")
+	if connStr == "" {
+		connStr = "amqp://guest:guest@localhost"
+	}
 	testSvc1 = "testSvc1"
 	testSvc2 = "testSvc2"
 	testSvc3 = "testSvc3"

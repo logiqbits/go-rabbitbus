@@ -12,21 +12,23 @@ import (
 )
 
 type defaultBuilder struct {
-	handlers         []types.Type
-	PrefetchCount    uint
-	connStr          string
-	purgeOnStartup   bool
-	sagaStoreConnStr string
-	txnl             bool
-	txConnStr        string
-	txnlProvider     string
-	workerNum        uint
-	serializer       gbus.Serializer
-	dlx              string
-	defaultPolicies  []gbus.MessagePolicy
-	confirm          bool
-	dbPingTimeout    time.Duration
-	usingPingTimeout bool
+	handlers          []types.Type
+	PrefetchCount     uint
+	connStr           string
+	purgeOnStartup    bool
+	sagaStoreConnStr  string
+	txnl              bool
+	txConnStr         string
+	txnlProvider      string
+	workerNum         uint
+	serializer        gbus.Serializer
+	dlx               string
+	defaultPolicies   []gbus.MessagePolicy
+	confirm           bool
+	mandatory         bool
+	noHandlerAction   gbus.NoHandlerAction
+	dbPingTimeout     time.Duration
+	usingPingTimeout  bool
 	resendsBufferSize int
 }
 
@@ -52,6 +54,8 @@ func (builder *defaultBuilder) Build(svcName string) gbus.Bus {
 		DbPingTimeout:        3}
 
 	gb.Confirm = builder.confirm
+	gb.Mandatory = builder.mandatory
+	gb.NoHandlerAction = builder.noHandlerAction
 	if builder.workerNum < 1 {
 		gb.WorkerNum = 1
 	} else {
@@ -107,12 +111,12 @@ func (builder *defaultBuilder) WorkerNum(workers uint, prefetchCount uint) gbus.
 }
 
 /*
-	WithSagas configures the bus to work with Sagas.
-	sagaStoreConnStr: the connection string to the saga store
+WithSagas configures the bus to work with Sagas.
+sagaStoreConnStr: the connection string to the saga store
 
-	Supported Saga Stores and the format of the connection string to use:
-	PostgreSQL: "PostgreSQL;User ID=root;Password=myPassword;Host=localhost;Port=5432;Database=myDataBase;"
-	In Memory:  ""
+Supported Saga Stores and the format of the connection string to use:
+PostgreSQL: "PostgreSQL;User ID=root;Password=myPassword;Host=localhost;Port=5432;Database=myDataBase;"
+In Memory:  ""
 */
 func (builder *defaultBuilder) WithSagas(sagaStoreConnStr string) gbus.Builder {
 	builder.sagaStoreConnStr = sagaStoreConnStr
@@ -121,6 +125,16 @@ func (builder *defaultBuilder) WithSagas(sagaStoreConnStr string) gbus.Builder {
 
 func (builder *defaultBuilder) WithConfirms() gbus.Builder {
 	builder.confirm = true
+	return builder
+}
+
+func (builder *defaultBuilder) WithMandatory() gbus.Builder {
+	builder.mandatory = true
+	return builder
+}
+
+func (builder *defaultBuilder) WithNoHandlerAction(action gbus.NoHandlerAction) gbus.Builder {
+	builder.noHandlerAction = action
 	return builder
 }
 

@@ -32,6 +32,7 @@ type DefaultBus struct {
 	rpcQueue       amqp.Queue
 	SvcName        string
 	amqpErrors     chan *amqp.Error
+	connErrors     chan *amqp.Error
 	amqpBlocks     chan amqp.Blocking
 	Registrations  []*Registration
 
@@ -46,7 +47,7 @@ type DefaultBus struct {
 	RegisteredSchemas    map[string]bool
 	DelayedSubscriptions [][]string
 	PurgeOnStartup       bool
-	started              bool
+	started              atomicBool
 	Glue                 SagaRegister
 	TxProvider           TxProvider
 	IsTxnl               bool
@@ -55,11 +56,32 @@ type DefaultBus struct {
 	DLX                  string
 	DefaultPolicies      []MessagePolicy
 	Confirm              bool
+	Mandatory            bool
+	NoHandlerAction      NoHandlerAction
 	ResendsBufferSize    int
 	healthChan           chan error
-	backpreasure         bool
-	rabbitFailure        bool
+	backpreasure         atomicBool
+	rabbitFailure        atomicBool
 	DbPingTimeout        time.Duration
+	shutdownOnce         sync.Once
+}
+
+// atomicBool is a boring wrapper so the bus state flags are accessed synchronously
+type atomicBool struct {
+	flag bool
+	mu   sync.RWMutex
+}
+
+func (a *atomicBool) Load() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.flag
+}
+
+func (a *atomicBool) Store(v bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.flag = v
 }
 
 var (
@@ -117,17 +139,21 @@ func (b *DefaultBus) createServiceQueue() (amqp.Queue, error) {
 	return q, e
 }
 
-func (b *DefaultBus) bindServiceQueue() {
+func (b *DefaultBus) bindServiceQueue() error {
 
 	if b.deadletterHandler != nil && b.DLX != "" {
-		b.AMQPChannel.ExchangeDeclare(b.DLX, /*name*/
+		if e := b.AMQPChannel.ExchangeDeclare(b.DLX, /*name*/
 			"fanout", /*kind*/
 			true,     /*durable*/
 			false,    /*autoDelete*/
 			false,    /*internal*/
 			false,    /*noWait*/
-			nil /*args amqp.Table*/)
-		b.bindQueue("", b.DLX)
+			nil /*args amqp.Table*/); e != nil {
+			return fmt.Errorf("failed to declare deadletter exchange %v: %w", b.DLX, e)
+		}
+		if e := b.bindQueue("", b.DLX); e != nil {
+			return fmt.Errorf("failed to bind queue %v to deadletter exchange %v: %w", b.serviceQueue.Name, b.DLX, e)
+		}
 	}
 	for _, subscription := range b.DelayedSubscriptions {
 		topic := subscription[0]
@@ -140,14 +166,13 @@ func (b *DefaultBus) bindServiceQueue() {
 			false,   /*noWait*/
 			nil /*args amqp.Table*/)
 		if e != nil {
-			b.log("failed to declare exchange %v\n%v", exchange, e)
-		} else {
-			e = b.bindQueue(topic, exchange)
-			if e != nil {
-				b.log("failed to bind to the following\n topic:%v\n exchange:%v\n%v", topic, exchange, e)
-			}
+			return fmt.Errorf("failed to declare exchange %v: %w", exchange, e)
+		}
+		if e = b.bindQueue(topic, exchange); e != nil {
+			return fmt.Errorf("failed to bind queue %v to topic:%v exchange:%v: %w", b.serviceQueue.Name, topic, exchange, e)
 		}
 	}
+	return nil
 }
 
 func (b *DefaultBus) createAMQPChannel(conn *amqp.Connection) (*amqp.Channel, error) {
@@ -175,15 +200,16 @@ func (b *DefaultBus) Start() error {
 	}
 
 	//register on failure notifications
-	b.amqpErrors = make(chan *amqp.Error)
-	b.amqpBlocks = make(chan amqp.Blocking)
-	b.amqpConn.NotifyClose(b.amqpErrors)
+	b.amqpErrors = make(chan *amqp.Error, 32)
+	b.connErrors = make(chan *amqp.Error, 32)
+	b.amqpBlocks = make(chan amqp.Blocking, 32)
+	b.amqpConn.NotifyClose(b.connErrors)
 	b.amqpConn.NotifyBlocked(b.amqpBlocks)
 	b.outAMQPChannel.NotifyClose(b.amqpErrors)
 	//TODO:Figure out what should be done
 
 	//init the outbox that sends the messages to the amqp transport and handles publisher confirms
-	if b.Outgoing.init(b.outAMQPChannel, b.Confirm, true, b.ResendsBufferSize); e != nil {
+	if e := b.Outgoing.initWithOptions(b.outAMQPChannel, b.Confirm, true, b.ResendsBufferSize, b.Mandatory); e != nil {
 		return e
 	}
 	/*
@@ -215,7 +241,9 @@ func (b *DefaultBus) Start() error {
 	b.serviceQueue = q
 
 	//bind queue
-	b.bindServiceQueue()
+	if e = b.bindServiceQueue(); e != nil {
+		return e
+	}
 
 	//declare rpc queue
 
@@ -232,7 +260,7 @@ func (b *DefaultBus) Start() error {
 		return createWorkersErr
 	}
 	b.workers = workers
-	b.started = true
+	b.started.Store(true)
 	//start monitoring on amqp related errors
 	go b.monitorAMQPErrors()
 	//start consuming messags from service queue
@@ -270,6 +298,7 @@ func (b *DefaultBus) createBusWorkers(workerNum uint) ([]*worker, error) {
 			handlersLock:      b.HandlersLock,
 			registrations:     b.Registrations,
 			serializer:        b.Serializer,
+			noHandlerAction:   b.NoHandlerAction,
 			b:                 b,
 			amqpErrors:        b.amqpErrors}
 		go w.Start()
@@ -282,7 +311,6 @@ func (b *DefaultBus) createBusWorkers(workerNum uint) ([]*worker, error) {
 //Shutdown implements GBus.Start()
 func (b *DefaultBus) Shutdown() (shutdwonErr error) {
 
-	b.log("Shuting down %v ", b.SvcName)
 	defer func() {
 		if p := recover(); p != nil {
 			pncMsg := fmt.Sprintf("%v\n%s", p, debug.Stack())
@@ -290,10 +318,19 @@ func (b *DefaultBus) Shutdown() (shutdwonErr error) {
 		}
 	}()
 
-	// Signal the health monitor to exit before we start tearing down channels,
-	// so it does not send on a closed health channel or panic on a closed
-	// connection notification.
-	b.started = false
+	b.shutdownOnce.Do(func() {
+		shutdwonErr = b.doShutdown()
+	})
+	return shutdwonErr
+}
+
+func (b *DefaultBus) doShutdown() error {
+
+	b.log("Shuting down %v ", b.SvcName)
+
+	// Signal the health monitor and workers to exit before we start tearing down channels,
+	// so nothing sends on a closed channel or spins on a closed delivery channel.
+	b.started.Store(false)
 
 	for _, worker := range b.workers {
 		worker.Stop()
@@ -319,6 +356,68 @@ func (b *DefaultBus) Shutdown() (shutdwonErr error) {
 	return nil
 }
 
+// Health implements BusManagement.Health
+func (b *DefaultBus) Health() bool {
+	if !b.started.Load() || b.rabbitFailure.Load() {
+		return false
+	}
+	if b.amqpConn == nil || b.amqpConn.IsClosed() {
+		return false
+	}
+	if b.AMQPChannel == nil || b.AMQPChannel.IsClosed() {
+		return false
+	}
+	if b.outAMQPChannel == nil || b.outAMQPChannel.IsClosed() {
+		return false
+	}
+	return true
+}
+
+// QueueDepth implements BusManagement.QueueDepth
+func (b *DefaultBus) QueueDepth(queue string) (int, error) {
+	ch, err := b.managementChannel()
+	if err != nil {
+		return 0, err
+	}
+	defer ch.Close()
+	q, err := ch.QueueDeclarePassive(queue,
+		true,  /*durable*/
+		false, /*autoDelete*/
+		false, /*exclusive*/
+		false, /*noWait*/
+		nil /*args*/)
+	if err != nil {
+		return 0, err
+	}
+	return q.Messages, nil
+}
+
+// Purge implements BusManagement.Purge
+func (b *DefaultBus) Purge(queue string) (int, error) {
+	ch, err := b.managementChannel()
+	if err != nil {
+		return 0, err
+	}
+	defer ch.Close()
+	return ch.QueuePurge(queue, false /*noWait*/)
+}
+
+// DeadletterCount implements BusManagement.DeadletterCount
+func (b *DefaultBus) DeadletterCount() (int, error) {
+	if b.DLX == "" {
+		return 0, nil
+	}
+	//in this topology the service queue itself is bound to the DLX, so it is the deadletter queue
+	return b.QueueDepth(b.SvcName)
+}
+
+func (b *DefaultBus) managementChannel() (*amqp.Channel, error) {
+	if b.amqpConn == nil || b.amqpConn.IsClosed() {
+		return nil, errors.New("bus is not connected to the broker")
+	}
+	return b.amqpConn.Channel()
+}
+
 //NotifyHealth implements Health.NotifyHealth
 func (b *DefaultBus) NotifyHealth(health chan error) {
 	if health == nil {
@@ -337,8 +436,8 @@ func (b *DefaultBus) GetHealth() HealthCard {
 
 	return HealthCard{
 		DbConnected:        dbConnected,
-		RabbitBackPressure: b.backpreasure,
-		RabbitConnected:    !b.rabbitFailure,
+		RabbitBackPressure: b.backpreasure.Load(),
+		RabbitConnected:    !b.rabbitFailure.Load(),
 	}
 }
 
@@ -398,7 +497,7 @@ func (b *DefaultBus) Send(ctx context.Context, toService string, message *BusMes
 //RPC implements  GBus.RPC
 func (b *DefaultBus) RPC(ctx context.Context, service string, request, reply *BusMessage, timeout time.Duration) (*BusMessage, error) {
 
-	if !b.started {
+	if !b.started.Load() {
 		return nil, errors.New("bus not strated or already shutdown, make sure you call bus.Start() before sending messages")
 	}
 
@@ -500,7 +599,7 @@ func (b *DefaultBus) RPC(ctx context.Context, service string, request, reply *Bu
 }
 
 func (b *DefaultBus) publishWithTx(ctx context.Context, ambientTx *sql.Tx, exchange, topic string, message *BusMessage, policies ...MessagePolicy) error {
-	if !b.started {
+	if !b.started.Load() {
 		return errors.New("bus not strated or already shutdown, make sure you call bus.Start() before sending messages")
 	}
 	message.Semantics = "evt"
@@ -511,7 +610,7 @@ func (b *DefaultBus) publishWithTx(ctx context.Context, ambientTx *sql.Tx, excha
 }
 
 func (b *DefaultBus) sendWithTx(ctx context.Context, ambientTx *sql.Tx, toService string, message *BusMessage, policies ...MessagePolicy) error {
-	if !b.started {
+	if !b.started.Load() {
 		return errors.New("bus not strated or already shutdown, make sure you call bus.Start() before sending messages")
 	}
 	message.Semantics = "cmd"
@@ -551,7 +650,7 @@ func (b *DefaultBus) HandleEvent(exchange, topic string, event Message, handler 
 
 	*/
 
-	if !b.started {
+	if !b.started.Load() {
 		subscription := make([]string, 0)
 		subscription = append(subscription, topic, exchange)
 		b.DelayedSubscriptions = append(b.DelayedSubscriptions, subscription)
@@ -600,7 +699,7 @@ func (b *DefaultBus) log(format string, v ...interface{}) {
 }
 func (b *DefaultBus) monitorAMQPErrors() {
 
-	for b.started {
+	for b.started.Load() {
 		select {
 		case blocked := <-b.amqpBlocks:
 			if blocked.Active {
@@ -608,14 +707,35 @@ func (b *DefaultBus) monitorAMQPErrors() {
 			} else {
 				b.log("amqp connection unblocked, reason:%v", blocked.Reason)
 			}
-			b.backpreasure = blocked.Active
+			b.backpreasure.Store(blocked.Active)
 		case amqpErr := <-b.amqpErrors:
-			b.rabbitFailure = true
+			b.rabbitFailure.Store(true)
 			b.log("amqp error: %v", amqpErr)
-			if b.healthChan != nil {
-				b.healthChan <- amqpErr
-			}
+			b.notifyHealth(amqpErr)
+		case connErr := <-b.connErrors:
+			//the connection itself is gone; a consumer on a dead connection that
+			//looks alive is worse than a crash, so shut the bus down and let the
+			//process owner restart it
+			b.rabbitFailure.Store(true)
+			b.log("amqp connection closed: %v. shutting down bus", connErr)
+			b.notifyHealth(connErr)
+			go func() {
+				if shutdownErr := b.Shutdown(); shutdownErr != nil {
+					b.log("error shutting down bus after connection loss: %v", shutdownErr)
+				}
+			}()
+			return
 		}
+	}
+}
+
+func (b *DefaultBus) notifyHealth(healthErr error) {
+	if b.healthChan == nil {
+		return
+	}
+	select {
+	case b.healthChan <- healthErr:
+	default:
 	}
 }
 
@@ -623,7 +743,7 @@ func (b *DefaultBus) sendImpl(ctx context.Context, tx *sql.Tx, toService, replyT
 	b.SenderLock.Lock()
 	defer b.SenderLock.Unlock()
 	//do not attempt to contact the borker if backpreasure is being applied
-	if b.backpreasure {
+	if b.backpreasure.Load() {
 		return errors.New("can't send message due to backpreasure from amqp broker")
 	}
 	defer func() {
