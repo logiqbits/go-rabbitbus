@@ -38,13 +38,23 @@ type worker struct {
 	txProvider        TxProvider
 	amqpErrors        chan *amqp.Error
 	stop              chan bool
+	stopOnce          sync.Once
 	stopped           chan struct{}
 }
 
 func (worker *worker) Start() error {
 
 	worker.log().Info("starting worker")
+	//private NotifyClose listener with a dedicated drainer; sharing one listener
+	//across channels panics on v1.13+ (amqp091-go closes it per channel) — see
+	//DefaultBus.drainNotifyClose and issue #360
+	worker.amqpErrors = make(chan *amqp.Error, 8)
 	worker.channel.NotifyClose(worker.amqpErrors)
+	go func() {
+		for e := range worker.amqpErrors {
+			worker.b.channelError(e)
+		}
+	}()
 
 	var (
 		messages, rpcmsgs <-chan amqp.Delivery
@@ -60,6 +70,7 @@ func (worker *worker) Start() error {
 	worker.messages = messages
 	worker.rpcMessages = rpcmsgs
 	worker.stop = make(chan bool)
+	worker.stopOnce = sync.Once{}
 	worker.stopped = make(chan struct{})
 	go worker.consumeMessages()
 
@@ -68,7 +79,11 @@ func (worker *worker) Start() error {
 
 func (worker *worker) Stop() error {
 	worker.log().Info("stopping worker")
-	close(worker.stop) // worker.stop <- true
+	worker.stopOnce.Do(func() {
+		if worker.stop != nil {
+			close(worker.stop)
+		}
+	})
 	if worker.stopped != nil {
 		select {
 		case <-worker.stopped:
