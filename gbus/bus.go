@@ -31,7 +31,6 @@ type DefaultBus struct {
 	serviceQueue   amqp.Queue
 	rpcQueue       amqp.Queue
 	SvcName        string
-	amqpErrors     chan *amqp.Error
 	connErrors     chan *amqp.Error
 	amqpBlocks     chan amqp.Blocking
 	Registrations  []*Registration
@@ -199,13 +198,14 @@ func (b *DefaultBus) Start() error {
 		return e
 	}
 
-	//register on failure notifications
-	b.amqpErrors = make(chan *amqp.Error, 32)
+	//register on failure notifications. the connection listener is drained by
+	//monitorAMQPErrors; every channel listener gets a private drained listener
+	//via drainNotifyClose — see the #360 note there
 	b.connErrors = make(chan *amqp.Error, 32)
 	b.amqpBlocks = make(chan amqp.Blocking, 32)
 	b.amqpConn.NotifyClose(b.connErrors)
 	b.amqpConn.NotifyBlocked(b.amqpBlocks)
-	b.outAMQPChannel.NotifyClose(b.amqpErrors)
+	b.drainNotifyClose(b.outAMQPChannel)
 	//TODO:Figure out what should be done
 
 	//init the outbox that sends the messages to the amqp transport and handles publisher confirms
@@ -223,7 +223,7 @@ func (b *DefaultBus) Start() error {
 			b.log("failed to create amqp channel for transactional relay\n%v", e)
 			return e
 		}
-		amqpChan.NotifyClose(b.amqpErrors)
+		b.drainNotifyClose(amqpChan)
 		amqpOutbox := &AMQPOutbox{}
 		amqpOutbox.init(amqpChan, b.Confirm, false, b.ResendsBufferSize)
 		if startErr := b.Outbox.Start(amqpOutbox); startErr != nil {
@@ -299,9 +299,12 @@ func (b *DefaultBus) createBusWorkers(workerNum uint) ([]*worker, error) {
 			registrations:     b.Registrations,
 			serializer:        b.Serializer,
 			noHandlerAction:   b.NoHandlerAction,
-			b:                 b,
-			amqpErrors:        b.amqpErrors}
-		go w.Start()
+			b:                 b}
+		//synchronous on purpose: a racing Stop (shutdown) must never see a
+		//half-initialized worker (nil stop channel, unsynchronized fields)
+		if startErr := w.Start(); startErr != nil {
+			return nil, startErr
+		}
 
 		workers = append(workers, w)
 	}
@@ -697,22 +700,74 @@ func (b *DefaultBus) connect(retryCount int) (*amqp.Connection, error) {
 func (b *DefaultBus) log(format string, v ...interface{}) {
 	log.WithField("Service", b.SvcName).Infof(format, v...)
 }
-func (b *DefaultBus) monitorAMQPErrors() {
+// channelError handles a NotifyClose event from one of the bus's channels.
+// It runs on the channel's own listener-drain goroutine (see Start and
+// worker.Start): every NotifyClose registration gets a private listener
+// channel plus a dedicated reader, because since v1.13 amqp091-go CLOSES the
+// listener channel when its channel dies — sharing one listener across
+// channels panics with "close of closed channel", and an undrained (full)
+// listener makes shutdown spawn its racing send goroutine
+// (https://github.com/rabbitmq/amqp091-go/issues/360).
+func (b *DefaultBus) channelError(e *amqp.Error) {
+	if !b.started.Load() {
+		//teardown noise: workers cancel their consumers while shutting down
+		return
+	}
+	b.rabbitFailure.Store(true)
+	b.log("amqp channel error: %v", e)
+	b.notifyHealth(e)
+}
 
-	for b.started.Load() {
+// drainNotifyClose registers a private NotifyClose listener on ch and returns
+// a started goroutine that forwards every event to channelError until the
+// listener is closed (amqp091-go closes it when ch dies). The goroutine IS the
+// dedicated drainer: the listener buffer can never be full, so connection
+// shutdown never takes the racing full-buffer send path of amqp091-go issue
+// #360 (https://github.com/rabbitmq/amqp091-go/issues/360) — a panic inside
+// amqp091-go goroutines that user code cannot recover.
+func (b *DefaultBus) drainNotifyClose(ch *amqp.Channel) {
+	listener := make(chan *amqp.Error, 8)
+	ch.NotifyClose(listener)
+	go func() {
+		for e := range listener {
+			b.channelError(e)
+		}
+	}()
+}
+
+func (b *DefaultBus) monitorAMQPErrors() {
+	//the connection's own NotifyClose/NotifyBlocked listeners are private to the
+	//connection, so this loop is their dedicated drainer: it keeps reading until
+	//connection shutdown closes them (amqp091-go v1.13+), instead of stopping at
+	//the started flag. A full listener buffer at shutdown is what makes
+	//amqp091-go spawn its racing send goroutine — "send on closed channel"
+	//inside library goroutines no user recover() can catch
+	//(https://github.com/rabbitmq/amqp091-go/issues/360). Channel-level
+	//listeners are drained by drainNotifyClose instead. Only doShutdown may
+	//close b.amqpConn; every other shutdown path (the connection-loss
+	//supervisor below included) signals through Shutdown.
+	for b.amqpBlocks != nil || b.connErrors != nil {
 		select {
-		case blocked := <-b.amqpBlocks:
+		case blocked, ok := <-b.amqpBlocks:
+			if !ok {
+				b.amqpBlocks = nil
+				continue
+			}
 			if blocked.Active {
 				b.log("amqp connection blocked. reason:%v", blocked.Reason)
 			} else {
 				b.log("amqp connection unblocked, reason:%v", blocked.Reason)
 			}
 			b.backpreasure.Store(blocked.Active)
-		case amqpErr := <-b.amqpErrors:
-			b.rabbitFailure.Store(true)
-			b.log("amqp error: %v", amqpErr)
-			b.notifyHealth(amqpErr)
-		case connErr := <-b.connErrors:
+		case connErr, ok := <-b.connErrors:
+			if !ok {
+				b.connErrors = nil
+				continue
+			}
+			if !b.started.Load() {
+				//already shutting down; keep draining until the listeners close
+				continue
+			}
 			//the connection itself is gone; a consumer on a dead connection that
 			//looks alive is worse than a crash, so shut the bus down and let the
 			//process owner restart it
@@ -724,7 +779,6 @@ func (b *DefaultBus) monitorAMQPErrors() {
 					b.log("error shutting down bus after connection loss: %v", shutdownErr)
 				}
 			}()
-			return
 		}
 	}
 }

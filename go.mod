@@ -7,7 +7,7 @@ require (
 	github.com/dangkaka/go-kafka-avro v0.0.0-20200609051134-e714c259f1e9
 	github.com/golang/protobuf v1.5.2
 	github.com/linkedin/goavro/v2 v2.9.0
-	github.com/rabbitmq/amqp091-go v1.5.0
+	github.com/rabbitmq/amqp091-go v1.14.0
 	github.com/rs/xid v1.4.0
 	github.com/sirupsen/logrus v1.9.0
 )
