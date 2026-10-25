@@ -63,6 +63,9 @@ type DefaultBus struct {
 	rabbitFailure        atomicBool
 	DbPingTimeout        time.Duration
 	shutdownOnce         sync.Once
+	AutoReconnect        bool
+	reconnecting         atomicBool
+	shutdownRequested    atomicBool
 }
 
 // atomicBool is a boring wrapper so the bus state flags are accessed synchronously
@@ -83,12 +86,29 @@ func (a *atomicBool) Store(v bool) {
 	a.flag = v
 }
 
+// CompareAndSwap sets the flag to new only when it is old; reports whether it did.
+func (a *atomicBool) CompareAndSwap(old, new bool) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.flag != old {
+		return false
+	}
+	a.flag = new
+	return true
+}
+
 var (
 	//TODO: Replace constants with configuration
 
 	//MaxRetryCount defines the max times a retry can run
 	MaxRetryCount uint = 3
-	rpcHeaderName      = "x-logiqbits-rabbitbus-msg-rpc-id"
+
+	//maxReconnectAttempts bounds AutoReconnect recovery before giving up to Shutdown
+	maxReconnectAttempts = 10
+	initialReconnectDelay = 5 * time.Second // doubles per failure, capped at maxReconnectDelay
+	maxReconnectDelay     = 30 * time.Second
+
+	rpcHeaderName = "x-logiqbits-rabbitbus-msg-rpc-id"
 )
 
 func (b *DefaultBus) createRPCQueue() (amqp.Queue, error) {
@@ -200,11 +220,14 @@ func (b *DefaultBus) Start() error {
 
 	//register on failure notifications. the connection listener is drained by
 	//monitorAMQPErrors; every channel listener gets a private drained listener
-	//via drainNotifyClose — see the #360 note there
+	//via drainNotifyClose — see the #360 note there. The monitor takes the
+	//channels by value so a reconnect generation never shares listeners.
 	b.connErrors = make(chan *amqp.Error, 32)
 	b.amqpBlocks = make(chan amqp.Blocking, 32)
-	b.amqpConn.NotifyClose(b.connErrors)
-	b.amqpConn.NotifyBlocked(b.amqpBlocks)
+	connErrors := b.connErrors
+	amqpBlocks := b.amqpBlocks
+	b.amqpConn.NotifyClose(connErrors)
+	b.amqpConn.NotifyBlocked(amqpBlocks)
 	b.drainNotifyClose(b.outAMQPChannel)
 	//TODO:Figure out what should be done
 
@@ -262,7 +285,7 @@ func (b *DefaultBus) Start() error {
 	b.workers = workers
 	b.started.Store(true)
 	//start monitoring on amqp related errors
-	go b.monitorAMQPErrors()
+	go b.monitorAMQPErrors(connErrors, amqpBlocks)
 	//start consuming messags from service queue
 
 	return nil
@@ -321,13 +344,16 @@ func (b *DefaultBus) Shutdown() (shutdwonErr error) {
 		}
 	}()
 
+	b.shutdownRequested.Store(true)
 	b.shutdownOnce.Do(func() {
-		shutdwonErr = b.doShutdown()
+		shutdwonErr = b.teardown()
 	})
 	return shutdwonErr
 }
 
-func (b *DefaultBus) doShutdown() error {
+// teardown stops workers and closes channels/connection. Shared by doShutdown
+// (final, once) and reconnectLoop (repeatable); every step is idempotent.
+func (b *DefaultBus) teardown() error {
 
 	b.log("Shuting down %v ", b.SvcName)
 
@@ -716,6 +742,7 @@ func (b *DefaultBus) channelError(e *amqp.Error) {
 	b.rabbitFailure.Store(true)
 	b.log("amqp channel error: %v", e)
 	b.notifyHealth(e)
+	b.scheduleReconnect(e)
 }
 
 // drainNotifyClose registers a private NotifyClose listener on ch and returns
@@ -735,7 +762,7 @@ func (b *DefaultBus) drainNotifyClose(ch *amqp.Channel) {
 	}()
 }
 
-func (b *DefaultBus) monitorAMQPErrors() {
+func (b *DefaultBus) monitorAMQPErrors(connErrors chan *amqp.Error, amqpBlocks chan amqp.Blocking) {
 	//the connection's own NotifyClose/NotifyBlocked listeners are private to the
 	//connection, so this loop is their dedicated drainer: it keeps reading until
 	//connection shutdown closes them (amqp091-go v1.13+), instead of stopping at
@@ -743,14 +770,15 @@ func (b *DefaultBus) monitorAMQPErrors() {
 	//amqp091-go spawn its racing send goroutine — "send on closed channel"
 	//inside library goroutines no user recover() can catch
 	//(https://github.com/rabbitmq/amqp091-go/issues/360). Channel-level
-	//listeners are drained by drainNotifyClose instead. Only doShutdown may
-	//close b.amqpConn; every other shutdown path (the connection-loss
-	//supervisor below included) signals through Shutdown.
-	for b.amqpBlocks != nil || b.connErrors != nil {
+	//listeners are drained by drainNotifyClose instead. Only Shutdown may
+	//close b.amqpConn; the connection-loss path signals through Shutdown or
+	//reconnectLoop (AutoReconnect). Both channels are parameters so a replaced
+	//(reconnected) generation never shares listeners with this goroutine.
+	for amqpBlocks != nil || connErrors != nil {
 		select {
-		case blocked, ok := <-b.amqpBlocks:
+		case blocked, ok := <-amqpBlocks:
 			if !ok {
-				b.amqpBlocks = nil
+				amqpBlocks = nil
 				continue
 			}
 			if blocked.Active {
@@ -759,9 +787,9 @@ func (b *DefaultBus) monitorAMQPErrors() {
 				b.log("amqp connection unblocked, reason:%v", blocked.Reason)
 			}
 			b.backpreasure.Store(blocked.Active)
-		case connErr, ok := <-b.connErrors:
+		case connErr, ok := <-connErrors:
 			if !ok {
-				b.connErrors = nil
+				connErrors = nil
 				continue
 			}
 			if !b.started.Load() {
@@ -769,16 +797,20 @@ func (b *DefaultBus) monitorAMQPErrors() {
 				continue
 			}
 			//the connection itself is gone; a consumer on a dead connection that
-			//looks alive is worse than a crash, so shut the bus down and let the
-			//process owner restart it
+			//looks alive is worse than a crash. AutoReconnect rebuilds the bus;
+			//otherwise shut down and let the process owner restart it
 			b.rabbitFailure.Store(true)
-			b.log("amqp connection closed: %v. shutting down bus", connErr)
+			b.log("amqp connection closed: %v", connErr)
 			b.notifyHealth(connErr)
-			go func() {
-				if shutdownErr := b.Shutdown(); shutdownErr != nil {
-					b.log("error shutting down bus after connection loss: %v", shutdownErr)
-				}
-			}()
+			if b.AutoReconnect {
+				go b.reconnectLoop(connErr)
+			} else {
+				go func() {
+					if shutdownErr := b.Shutdown(); shutdownErr != nil {
+						b.log("error shutting down bus after connection loss: %v", shutdownErr)
+					}
+				}()
+			}
 		}
 	}
 }
@@ -790,6 +822,50 @@ func (b *DefaultBus) notifyHealth(healthErr error) {
 	select {
 	case b.healthChan <- healthErr:
 	default:
+	}
+}
+
+// scheduleRebuild starts reconnectLoop unless one is already running or the
+// bus is not started. Caller: channelError; connection death starts the loop
+// straight from monitorAMQPErrors.
+func (b *DefaultBus) scheduleReconnect(cause error) {
+	if !b.AutoReconnect || !b.started.Load() {
+		return
+	}
+	go b.reconnectLoop(cause)
+}
+
+// reconnectLoop: teardown + Start() until the broker is reachable. Registrations
+// live on the bus, so Start re-binds everything and redeclares topology (which
+// also heals 404-missing-exchange kills). Concurrent triggers collapse into one
+// rebuild; after maxReconnectAttempts failures it gives up and shuts down.
+func (b *DefaultBus) reconnectLoop(cause error) {
+	if !b.reconnecting.CompareAndSwap(false, true) {
+		return // a rebuild is already in progress
+	}
+	defer b.reconnecting.Store(false)
+
+	backoff := initialReconnectDelay
+	for attempt := 1; ; attempt++ {
+		if b.shutdownRequested.Load() {
+			return // user Shutdown raced us; teardown is not ours to redo
+		}
+		b.log("amqp reconnect attempt %d after: %v", attempt, cause)
+		b.notifyHealth(fmt.Errorf("amqp reconnect attempt %d: %w", attempt, cause))
+		_ = b.teardown()
+		if err := b.Start(); err == nil {
+			b.rabbitFailure.Store(false)
+			b.log("amqp reconnected after %d attempt(s)", attempt)
+			return
+		} else if attempt >= maxReconnectAttempts {
+			b.log("amqp reconnect gave up after %d attempts: %v. shutting down bus", attempt, err)
+			_ = b.Shutdown()
+			return
+		}
+		time.Sleep(backoff)
+		if backoff *= 2; backoff > maxReconnectDelay {
+			backoff = maxReconnectDelay
+		}
 	}
 }
 

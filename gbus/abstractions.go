@@ -196,6 +196,13 @@ type Builder interface {
 	*/
 	WithResendsBufferSize(size int) Builder
 
+	/*
+	   WithAutoReconnect makes the bus recover from connection/channel death by
+	   rebuilding itself (backoff, redeclare topology, restart consumers)
+	   instead of shutting down for the process owner to restart.
+	*/
+	WithAutoReconnect() Builder
+
 	//WithPolicies defines the default policies that are applied for evey outgoing amqp messge
 	WithPolicies(policies ...MessagePolicy) Builder
 
