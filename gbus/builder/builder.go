@@ -30,6 +30,7 @@ type defaultBuilder struct {
 	dbPingTimeout     time.Duration
 	usingPingTimeout  bool
 	resendsBufferSize int
+	autoReconnect     bool
 }
 
 func (builder *defaultBuilder) Build(svcName string) gbus.Bus {
@@ -56,6 +57,7 @@ func (builder *defaultBuilder) Build(svcName string) gbus.Bus {
 	gb.Confirm = builder.confirm
 	gb.Mandatory = builder.mandatory
 	gb.NoHandlerAction = builder.noHandlerAction
+	gb.AutoReconnect = builder.autoReconnect
 	if builder.workerNum < 1 {
 		gb.WorkerNum = 1
 	} else {
@@ -140,6 +142,14 @@ func (builder *defaultBuilder) WithNoHandlerAction(action gbus.NoHandlerAction) 
 
 func (builder *defaultBuilder) WithResendsBufferSize(size int) gbus.Builder {
 	builder.resendsBufferSize = size
+	return builder
+}
+
+// WithAutoReconnect makes the bus rebuild itself (reconnect, redeclare
+// topology, restart consumers) after a connection or channel death, with
+// backoff, instead of shutting down for the process owner to restart.
+func (builder *defaultBuilder) WithAutoReconnect() gbus.Builder {
+	builder.autoReconnect = true
 	return builder
 }
 
