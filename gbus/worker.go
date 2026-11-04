@@ -19,27 +19,29 @@ import (
 
 type worker struct {
 	*Safety
-	channel           *amqp.Channel
-	messages          <-chan amqp.Delivery
-	rpcMessages       <-chan amqp.Delivery
-	q                 amqp.Queue
-	rpcq              amqp.Queue
-	consumerTag       string
-	svcName           string
-	rpcLock           *sync.Mutex
-	handlersLock      *sync.Mutex
-	registrations     []*Registration
-	rpcHandlers       map[string]MessageHandler
-	deadletterHandler func(tx *sql.Tx, poision amqp.Delivery) error
-	noHandlerAction   NoHandlerAction
-	isTxnl            bool
-	b                 *DefaultBus
-	serializer        Serializer
-	txProvider        TxProvider
-	amqpErrors        chan *amqp.Error
-	stop              chan bool
-	stopOnce          sync.Once
-	stopped           chan struct{}
+	channel               *amqp.Channel
+	messages              <-chan amqp.Delivery
+	rpcMessages           <-chan amqp.Delivery
+	q                     amqp.Queue
+	rpcq                  amqp.Queue
+	consumerTag           string
+	svcName               string
+	rpcLock               *sync.Mutex
+	handlersLock          *sync.Mutex
+	registrations         []*Registration
+	rpcHandlers           map[string]MessageHandler
+	deadletterHandler     func(tx *sql.Tx, poision amqp.Delivery) error
+	noHandlerAction       NoHandlerAction
+	isTxnl                bool
+	dlx                   string
+	maxDeadletterAttempts int
+	b                     *DefaultBus
+	serializer            Serializer
+	txProvider            TxProvider
+	amqpErrors            chan *amqp.Error
+	stop                  chan bool
+	stopOnce              sync.Once
+	stopped               chan struct{}
 }
 
 func (worker *worker) Start() error {
@@ -251,33 +253,102 @@ func (worker *worker) Reject(requeue bool, delivery amqp.Delivery) error {
 	return worker.SafeWithRetries(reject, MaxRetryCount)
 }
 
-func (worker *worker) isDead(delivery amqp.Delivery) bool {
+// xDeathEntries extracts the parsed x-death header entries (each an amqp.Table
+// with queue/exchange/reason/time/count/routing-keys) from a delivery.
+// ponytail: entries whose value is not an amqp.Table are skipped, the broker
+// always sends tables — upgrade: surface malformed entries in logs if a foreign
+// publisher proves otherwise
+func xDeathEntries(delivery amqp.Delivery) []amqp.Table {
+	raw, found := delivery.Headers["x-death"]
+	if !found || raw == nil {
+		return nil
+	}
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	entries := make([]amqp.Table, 0, len(list))
+	for _, e := range list {
+		if tbl, ok := e.(amqp.Table); ok {
+			entries = append(entries, tbl)
+		}
+	}
+	return entries
+}
 
-	if xDeath := delivery.Headers["x-death"]; xDeath != nil {
-		return true
+func xDeathCount(entry amqp.Table) int64 {
+	switch c := entry["count"].(type) {
+	case int64:
+		return c
+	case int32:
+		return int64(c)
+	case int:
+		return int64(c)
+	case float64:
+		return int64(c)
+	default:
+		return 0
+	}
+}
+
+// isDead reports whether the delivery is a dead-lettered message that cycled
+// back into THIS service queue from the configured dead-letter exchange. A
+// message that merely carries x-death from some other queue (e.g. redelivered
+// from a TTL retry queue, or forwarded by a foreign DLX) is NOT dead here and
+// falls through to normal processing.
+func (worker *worker) isDead(delivery amqp.Delivery) bool {
+	entries := xDeathEntries(delivery)
+	if len(entries) == 0 {
+		return false
+	}
+	//entries are sorted most-recent first by the broker
+	last := entries[0]
+	queue, _ := last["queue"].(string)
+	return queue == worker.svcName && delivery.Exchange == worker.dlx
+}
+
+// deadAttemptsExceeded reports whether the x-death count of this service queue
+// reached the configured cap, meaning the message must be parked instead of
+// being handed to the deadletter handler (or rejected) again.
+func (worker *worker) deadAttemptsExceeded(delivery amqp.Delivery) bool {
+	for _, entry := range xDeathEntries(delivery) {
+		queue, _ := entry["queue"].(string)
+		if queue == worker.svcName && xDeathCount(entry) >= int64(worker.maxDeadletterAttempts) {
+			return true
+		}
 	}
 	return false
 }
 
 func (worker *worker) invokeDeadletterHandler(delivery amqp.Delivery) {
-	if worker.txProvider == nil {
-		worker.log().WithField("message id", delivery.MessageId).
-			Warn("deadletter handler registered on a non-transactional bus; rejecting message")
-		worker.Reject(false, delivery)
-		return
-	}
-	tx, txCreateErr := worker.txProvider.New()
-	if txCreateErr != nil {
-		worker.log().WithError(txCreateErr).Error("failed to create transaction for deadletter handler; rejecting message")
-		worker.Reject(false, delivery)
-		return
+	var tx *sql.Tx
+	if worker.txProvider != nil {
+		newTx, txCreateErr := worker.txProvider.New()
+		if txCreateErr != nil {
+			worker.log().WithError(txCreateErr).Error("failed to create transaction for deadletter handler; rejecting message")
+			worker.Reject(false, delivery)
+			return
+		}
+		tx = newTx
 	}
 	deadErr := worker.deadletterHandler(tx, delivery)
 	if deadErr != nil {
-		worker.SafeWithRetries(tx.Rollback, MaxRetryCount)
-
+		if tx != nil {
+			worker.SafeWithRetries(tx.Rollback, MaxRetryCount)
+		}
+		worker.Reject(false, delivery)
 	} else {
-		worker.SafeWithRetries(tx.Commit, MaxRetryCount)
+		if tx != nil {
+			commitErr := worker.SafeWithRetries(tx.Commit, MaxRetryCount)
+			if commitErr != nil {
+				worker.log().WithError(commitErr).Error("failed committing deadletter handler transaction; rejecting message")
+				worker.Reject(false, delivery)
+				return
+			}
+		}
+		if ackErr := worker.Ack(delivery); ackErr != nil {
+			worker.log().WithError(ackErr).Error("failed to ack dead-lettered message after deadletter handler")
+		}
 	}
 }
 
@@ -299,6 +370,16 @@ func (worker *worker) processMessage(delivery amqp.Delivery, isRPCreply bool) {
 
 	//handle a message that originated from a deadletter exchange
 	if worker.isDead(delivery) {
+		if worker.deadAttemptsExceeded(delivery) {
+			//the message kept failing and cycled back more times than allowed; ack it so
+			//it stops looping and park it for an operator to inspect via the management API
+			worker.log().WithFields(log.Fields{"message id": delivery.MessageId, "routing key": delivery.RoutingKey}).
+				Error("dead-lettered message exceeded max deadletter attempts; parking (acked) — operator must intervene via the management API")
+			if ackErr := worker.Ack(delivery); ackErr != nil {
+				worker.log().WithError(ackErr).Error("failed to ack parked dead-lettered message")
+			}
+			return
+		}
 		if worker.deadletterHandler == nil {
 			//no deadletter handler registered; reject (requeue=false) so the message is
 			//deliberately routed to the DLX instead of acked away or crashing the worker

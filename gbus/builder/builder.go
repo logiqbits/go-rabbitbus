@@ -29,8 +29,10 @@ type defaultBuilder struct {
 	noHandlerAction   gbus.NoHandlerAction
 	dbPingTimeout     time.Duration
 	usingPingTimeout  bool
-	resendsBufferSize int
-	autoReconnect     bool
+	resendsBufferSize     int
+	autoReconnect         bool
+	maxDeadletterAttempts int
+	retryDelays           []time.Duration
 }
 
 func (builder *defaultBuilder) Build(svcName string) gbus.Bus {
@@ -69,6 +71,10 @@ func (builder *defaultBuilder) Build(svcName string) gbus.Bus {
 		gb.ResendsBufferSize = builder.resendsBufferSize
 	}
 	gb.PrefetchCount = builder.PrefetchCount
+	if builder.maxDeadletterAttempts > 0 {
+		gb.MaxDeadletterAttempts = builder.maxDeadletterAttempts
+	}
+	gb.RetryDelays = builder.retryDelays
 	var (
 		sagaStore saga.Store
 	)
@@ -150,6 +156,20 @@ func (builder *defaultBuilder) WithResendsBufferSize(size int) gbus.Builder {
 // backoff, instead of shutting down for the process owner to restart.
 func (builder *defaultBuilder) WithAutoReconnect() gbus.Builder {
 	builder.autoReconnect = true
+	return builder
+}
+
+// WithMaxDeadletterAttempts caps dead-letter redelivery cycles before a message
+// is parked (acked + error logged). Defaults to 3.
+func (builder *defaultBuilder) WithMaxDeadletterAttempts(n int) gbus.Builder {
+	builder.maxDeadletterAttempts = n
+	return builder
+}
+
+// WithDelayedRetry declares the TTL retry topology for the given delays — see
+// the Builder interface doc for the full contract.
+func (builder *defaultBuilder) WithDelayedRetry(delays ...time.Duration) gbus.Builder {
+	builder.retryDelays = append(builder.retryDelays, delays...)
 	return builder
 }
 

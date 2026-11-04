@@ -17,6 +17,7 @@ type Bus interface {
 	SagaRegister
 	Health
 	BusManagement
+	BusRetry
 }
 
 // NoHandlerAction determines how the bus treats an incoming message for which no handler is registered
@@ -52,6 +53,21 @@ type BusManagement interface {
 		topology the service queue itself is bound to the DLX, so the count reflects that queue's depth.
 	*/
 	DeadletterCount() (int, error)
+}
+
+//BusRetry exposes the delayed-retry topology of the bus. The bus is wired for
+//delayed retry only when built with builder.WithDelayedRetry; otherwise the
+//exchange exists only if some other component declared it.
+type BusRetry interface {
+	/*
+		RetryExchange returns the name of the fanout exchange a handler should
+		republish a transiently failing message to (via invocation.Publish with an
+		empty routing key) so it is redelivered to the service queue after the
+		configured delay.
+		Never republish RPC/command replies here — a delayed reply breaks the
+		waiting RPC caller.
+	*/
+	RetryExchange() string
 }
 
 //Message a common interface that passes to the serializers to allow decoding and encoding of content
@@ -218,6 +234,26 @@ type Builder interface {
 	   is registered. Defaults to NoHandlerAck (legacy behavior: ack and drop).
 	*/
 	WithNoHandlerAction(action NoHandlerAction) Builder
+
+	/*
+	   WithMaxDeadletterAttempts caps how many times a dead-lettered message is routed
+	   back from the dead-letter exchange and handed to the deadletter handler before the
+	   bus gives up on it: instead of rejecting it again (which would re-loop forever)
+	   the message is acked and parked, and an error is logged — the operator must
+	   intervene via the management API. Defaults to 3.
+	*/
+	WithMaxDeadletterAttempts(n int) Builder
+
+	/*
+	   WithDelayedRetry wires native delayed retry: for each delay the bus declares a
+	   durable TTL queue <svc>.retry.<delay> bound to the fanout exchange
+	   gbus.RetryExchange(svc) (also reachable via the bus method RetryExchange()).
+	   Handlers republish transient failures to that exchange via invocation.Publish
+	   with an empty routing key; after the TTL the broker dead-letters the message
+	   back into the service queue, where it is processed normally.
+	   Do NOT republish RPC/command replies — a delayed reply breaks the waiting RPC caller.
+	*/
+	WithDelayedRetry(delays ...time.Duration) Builder
 
 	//ConfigureHealthCheck defines the default timeout in seconds for the db ping check
 	ConfigureHealthCheck(timeoutInSeconds time.Duration) Builder

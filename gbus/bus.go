@@ -16,6 +16,7 @@ import (
 )
 
 var _ SagaRegister = &DefaultBus{}
+var _ BusRetry = &DefaultBus{}
 
 //DefaultBus implements the Bus interface
 type DefaultBus struct {
@@ -66,6 +67,8 @@ type DefaultBus struct {
 	AutoReconnect        bool
 	reconnecting         atomicBool
 	shutdownRequested    atomicBool
+	RetryDelays          []time.Duration
+	MaxDeadletterAttempts int
 }
 
 // atomicBool is a boring wrapper so the bus state flags are accessed synchronously
@@ -109,7 +112,24 @@ var (
 	maxReconnectDelay     = 30 * time.Second
 
 	rpcHeaderName = "x-logiqbits-rabbitbus-msg-rpc-id"
+
+	//defaultMaxDeadletterAttempts caps how many times a dead-lettered message is
+	//handed back to the deadletter handler before it is parked; overridable via
+	//builder.WithMaxDeadletterAttempts
+	defaultMaxDeadletterAttempts = 3
 )
+
+// RetryExchange returns the name of the fanout exchange used for delayed retry
+// of the service (or exchange) named by the caller. The bus declares this
+// exchange plus one TTL retry queue per configured delay — see
+// builder.WithDelayedRetry. Handlers republish transiently failing messages to
+// it via invocation.Publish; after the TTL the broker dead-letters them back
+// into the service queue where they are processed normally.
+// NOTE: never republish RPC/command replies here — a delayed reply breaks the
+// waiting RPC caller.
+func RetryExchange(name string) string {
+	return name + ".retry"
+}
 
 func (b *DefaultBus) createRPCQueue() (amqp.Queue, error) {
 	/*
@@ -194,6 +214,59 @@ func (b *DefaultBus) bindServiceQueue() error {
 	return nil
 }
 
+// declareDelayedRetryTopology declares, for each configured delay, a durable
+// TTL queue <svc>.retry.<delay> bound to the fanout exchange RetryExchange(svc).
+// Expired messages are dead-lettered through the default exchange back into the
+// service queue, so they re-enter normal processing after the delay. Idempotent
+// so reconnect-triggered Start() calls can redeclare safely.
+func (b *DefaultBus) declareDelayedRetryTopology() error {
+	if len(b.RetryDelays) == 0 {
+		return nil
+	}
+	retryEx := RetryExchange(b.SvcName)
+	if err := b.AMQPChannel.ExchangeDeclare(retryEx, /*name*/
+		"fanout", /*kind*/
+		true,     /*durable*/
+		false,    /*autoDelete*/
+		false,    /*internal*/
+		false,    /*noWait*/
+		nil /*args*/); err != nil {
+		return fmt.Errorf("failed to declare retry exchange %v: %w", retryEx, err)
+	}
+	for _, delay := range b.RetryDelays {
+		if delay <= 0 {
+			continue
+		}
+		qName := b.SvcName + ".retry." + delay.String()
+		args := amqp.Table{
+			"x-message-ttl":             int32(delay.Milliseconds()),
+			"x-dead-letter-exchange":    "",
+			"x-dead-letter-routing-key": b.SvcName,
+		}
+		if _, err := b.AMQPChannel.QueueDeclare(qName,
+			true,  /*durable*/
+			false, /*autoDelete*/
+			false, /*exclusive*/
+			false, /*noWait*/
+			args /*args*/); err != nil {
+			return fmt.Errorf("failed to declare retry queue %v: %w", qName, err)
+		}
+		if err := b.AMQPChannel.QueueBind(qName, /*name*/
+			"",       /*key*/
+			retryEx,  /*exchange*/
+			false,    /*noWait*/
+			nil /*args*/); err != nil {
+			return fmt.Errorf("failed to bind retry queue %v to exchange %v: %w", qName, retryEx, err)
+		}
+	}
+	return nil
+}
+
+// RetryExchange implements BusRetry.RetryExchange
+func (b *DefaultBus) RetryExchange() string {
+	return RetryExchange(b.SvcName)
+}
+
 func (b *DefaultBus) createAMQPChannel(conn *amqp.Connection) (*amqp.Channel, error) {
 	channel, e := conn.Channel()
 	if e != nil {
@@ -268,6 +341,11 @@ func (b *DefaultBus) Start() error {
 		return e
 	}
 
+	//declare delayed-retry topology (no-op when no delays are configured)
+	if e = b.declareDelayedRetryTopology(); e != nil {
+		return e
+	}
+
 	//declare rpc queue
 
 	if b.rpcQueue, e = b.createRPCQueue(); e != nil {
@@ -307,22 +385,29 @@ func (b *DefaultBus) createBusWorkers(workerNum uint) ([]*worker, error) {
 
 		tag := fmt.Sprintf("%s_worker_%d", b.SvcName, i)
 
+		maxDeadletterAttempts := b.MaxDeadletterAttempts
+		if maxDeadletterAttempts < 1 {
+			maxDeadletterAttempts = defaultMaxDeadletterAttempts
+		}
+
 		w := &worker{
-			consumerTag:       tag,
-			channel:           amqpChan,
-			q:                 b.serviceQueue,
-			rpcq:              b.rpcQueue,
-			svcName:           b.SvcName,
-			isTxnl:            b.IsTxnl,
-			txProvider:        b.TxProvider,
-			rpcLock:           b.RPCLock,
-			rpcHandlers:       b.RPCHandlers,
-			deadletterHandler: b.deadletterHandler,
-			handlersLock:      b.HandlersLock,
-			registrations:     b.Registrations,
-			serializer:        b.Serializer,
-			noHandlerAction:   b.NoHandlerAction,
-			b:                 b}
+			consumerTag:           tag,
+			channel:               amqpChan,
+			q:                     b.serviceQueue,
+			rpcq:                  b.rpcQueue,
+			svcName:               b.SvcName,
+			isTxnl:                b.IsTxnl,
+			txProvider:            b.TxProvider,
+			rpcLock:               b.RPCLock,
+			rpcHandlers:           b.RPCHandlers,
+			deadletterHandler:     b.deadletterHandler,
+			handlersLock:          b.HandlersLock,
+			registrations:         b.Registrations,
+			serializer:            b.Serializer,
+			noHandlerAction:       b.NoHandlerAction,
+			dlx:                   b.DLX,
+			maxDeadletterAttempts: maxDeadletterAttempts,
+			b:                     b}
 		//synchronous on purpose: a racing Stop (shutdown) must never see a
 		//half-initialized worker (nil stop channel, unsynchronized fields)
 		if startErr := w.Start(); startErr != nil {
